@@ -5,6 +5,100 @@ MODE="${SBASH_MODE:-normal}"
 LLM_URL="${SBASH_LLM_URL:-}"
 LLM_KEY="${SBASH_LLM_API_KEY:-}"
 
+selected_provider="none"
+provider_method="none"
+provider_status="sbash: no LLM provider found; running without AI review"
+
+select_provider() {
+  if command -v codex >/dev/null 2>&1; then
+    selected_provider="codex"
+    provider_method="cli"
+    provider_status="sbash: using codex CLI"
+    return
+  fi
+
+  if command -v claude >/dev/null 2>&1; then
+    selected_provider="claude"
+    provider_method="cli"
+    provider_status="sbash: using claude CLI"
+    return
+  fi
+
+  if command -v gemini >/dev/null 2>&1; then
+    selected_provider="gemini"
+    provider_method="cli"
+    provider_status="sbash: using gemini CLI"
+    return
+  fi
+
+  if [ -n "${OPENAI_API_KEY:-}" ]; then
+    selected_provider="openai"
+    provider_method="api_key"
+    provider_status="sbash: using OpenAI key"
+    return
+  fi
+
+  if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    selected_provider="anthropic"
+    provider_method="api_key"
+    provider_status="sbash: using Anthropic key"
+    return
+  fi
+
+  if [ -n "${GEMINI_API_KEY:-}" ]; then
+    selected_provider="gemini"
+    provider_method="api_key"
+    provider_status="sbash: using Gemini key"
+    return
+  fi
+
+  if [ -n "${OPENROUTER_API_KEY:-}" ]; then
+    selected_provider="openrouter"
+    provider_method="api_key"
+    provider_status="sbash: using OpenRouter key"
+    return
+  fi
+}
+
+invoke_provider() {
+  # $1 = prompt, $2 = output file
+  local prompt="$1"
+  local out="$2"
+
+  if [ "$provider_method" = "cli" ]; then
+    case "$selected_provider" in
+      codex)
+        codex "$prompt" >"$out" 2>/dev/null
+        return $?
+        ;;
+      claude)
+        claude "$prompt" >"$out" 2>/dev/null
+        return $?
+        ;;
+      gemini)
+        gemini "$prompt" >"$out" 2>/dev/null
+        return $?
+        ;;
+    esac
+    return 1
+  fi
+
+  if [ "$provider_method" = "api_key" ]; then
+    [ -n "$LLM_URL" ] || return 1
+    [ -n "${LLM_KEY:-}" ] || LLM_KEY="${OPENAI_API_KEY:-${ANTHROPIC_API_KEY:-${GEMINI_API_KEY:-${OPENROUTER_API_KEY:-}}}}"
+    [ -n "$LLM_KEY" ] || return 1
+
+    curl -sS -m 15 -X POST "$LLM_URL" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $LLM_KEY" \
+      -d "{\"prompt\": $(printf '%s' "$prompt" | sed 's/\\/\\\\/g; s/\"/\\\"/g; :a;N;$!ba;s/\n/\\n/g' | awk '{printf "\"%s\"", $0}') }" \
+      >"$out"
+    return $?
+  fi
+
+  return 1
+}
+
 tmp_script=""
 tmp_ai=""
 cleanup() {
@@ -56,7 +150,10 @@ fi
 llm_decision="unknown"
 llm_reason=""
 
-if [ -n "$LLM_URL" ] && command -v curl >/dev/null 2>&1 && [ "$heuristic_level" != "dangerous" ]; then
+select_provider
+echo "$provider_status" >&2
+
+if [ "$selected_provider" != "none" ] && [ "$heuristic_level" != "dangerous" ]; then
   tmp_ai="$(mktemp)" || {
     echo "sbash: failed to create temp file" >&2
     exit 1
@@ -64,22 +161,8 @@ if [ -n "$LLM_URL" ] && command -v curl >/dev/null 2>&1 && [ "$heuristic_level" 
 
   prompt="You are a shell safety checker. Respond on one line in this exact format: DECISION: <ALLOW|BLOCK|CAUTION>; REASON: <short reason>.\nHeuristic status: $heuristic_level.\nScript:\n$script_text"
 
-  auth_header=""
-  if [ -n "$LLM_KEY" ]; then
-    auth_header="Authorization: Bearer $LLM_KEY"
-  fi
-
-  if [ -n "$auth_header" ]; then
-    curl -sS -m 15 -X POST "$LLM_URL" \
-      -H "Content-Type: application/json" \
-      -H "$auth_header" \
-      -d "{\"prompt\": $(printf '%s' "$prompt" | sed 's/\\/\\\\/g; s/"/\\"/g; :a;N;$!ba;s/\n/\\n/g' | awk '{printf "\"%s\"", $0}') }" \
-      >"$tmp_ai" || true
-  else
-    curl -sS -m 15 -X POST "$LLM_URL" \
-      -H "Content-Type: application/json" \
-      -d "{\"prompt\": $(printf '%s' "$prompt" | sed 's/\\/\\\\/g; s/"/\\"/g; :a;N;$!ba;s/\n/\\n/g' | awk '{printf "\"%s\"", $0}') }" \
-      >"$tmp_ai" || true
+  if ! invoke_provider "$prompt" "$tmp_ai"; then
+    echo "sbash: provider call failed; running local-only safety checks" >&2
   fi
 
   ai_line="$(grep -Eo 'DECISION:[^\n]*' "$tmp_ai" | head -n1)"
