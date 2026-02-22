@@ -9,6 +9,8 @@ ALLOW_ON_ERROR="${SBASH_ALLOW_ON_ERROR:-}"
 LLM_URL="${SBASH_LLM_URL:-}"
 LLM_KEY="${SBASH_LLM_API_KEY:-}"
 SCRIPT_SOURCE_URL="${SBASH_SOURCE_URL:-${SCRIPT_SOURCE_URL:-}}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RULES_FILE="${SBASH_RULES_FILE:-$SCRIPT_DIR/rules/heuristic_rules.tsv}"
 
 if [ "$MODE" != "normal" ] && [ "$MODE" != "cautious" ]; then
   MODE="normal"
@@ -208,40 +210,60 @@ tmp_script="$(mktemp)" || {
 cat >"$tmp_script"
 script_text="$(cat "$tmp_script")"
 
-heuristic_level="clear"
+heuristic_level="clean"
 heuristic_reason=""
+heuristic_rule_risk=""
 
-if printf '%s\n' "$script_text" | grep -Eiq '(^|[[:space:]])rm[[:space:]]+-rf[[:space:]]+/(\s|$|[^[:alnum:]_])'; then
-  heuristic_level="dangerous"
-  heuristic_reason="contains destructive root deletion pattern"
-elif printf '%s\n' "$script_text" | grep -Eiq '(^|[[:space:]])(mkfs|fdisk|parted|wipefs)([[:space:]]|$)'; then
-  heuristic_level="dangerous"
-  heuristic_reason="contains disk formatting or partitioning command"
-elif printf '%s\n' "$script_text" | grep -Eiq ':\(\)[[:space:]]*\{[[:space:]]*:[[:space:]]*\|[[:space:]]*:[[:space:]]*&[[:space:]]*\};[[:space:]]*:'; then
-  heuristic_level="dangerous"
-  heuristic_reason="contains fork bomb pattern"
-elif printf '%s\n' "$script_text" | grep -Eiq '(^|[[:space:]])dd[[:space:]].*of=/dev/(sd[a-z]|nvme[0-9]+n[0-9]+|vd[a-z])'; then
-  heuristic_level="dangerous"
-  heuristic_reason="contains direct block-device overwrite command"
-elif printf '%s\n' "$script_text" | grep -Fq 'SBASH_MALWARE_TEST_STRING'; then
-  heuristic_level="dangerous"
-  heuristic_reason="contains test malware signature string"
-elif printf '%s\n' "$script_text" | grep -Eiq 'curl[^\n|;]*\|[[:space:]]*(sh|bash)\b|wget[^\n|;]*\|[[:space:]]*(sh|bash)\b'; then
-  heuristic_level="suspicious"
-  heuristic_reason="contains remote script piping into a shell"
-elif printf '%s\n' "$script_text" | grep -Eiq '(^|[[:space:]])(sudo[[:space:]]+)?rm[[:space:]]+-rf[[:space:]]+~|(^|[[:space:]])eval[[:space:]]'; then
-  heuristic_level="suspicious"
-  heuristic_reason="contains risky command constructs"
+evaluate_heuristics() {
+  local script="$1"
+  local rule_line=""
+  local severity=""
+  local pattern=""
+  local reason=""
+  local risk=""
+
+  if [ ! -f "$RULES_FILE" ]; then
+    echo "sbash: rules file not found: $RULES_FILE" >&2
+    return 1
+  fi
+
+  while IFS=$'\t' read -r severity pattern reason risk; do
+    [ -n "$severity" ] || continue
+    case "$severity" in
+      \#*)
+        continue
+        ;;
+    esac
+
+    if printf '%s\n' "$script" | grep -Eiq "$pattern"; then
+      heuristic_level="$severity"
+      heuristic_reason="$reason"
+      heuristic_rule_risk="$risk"
+      return 0
+    fi
+  done <"$RULES_FILE"
+
+  heuristic_level="clean"
+  heuristic_reason="no heuristic rule matched"
+  heuristic_rule_risk="none"
+  return 0
+}
+
+if ! evaluate_heuristics "$script_text"; then
+  echo "Blocked: failed to evaluate heuristic rules." >&2
+  exit 126
 fi
 
-if [ "$heuristic_level" = "dangerous" ]; then
-  echo "Blocked: $heuristic_reason." >&2
+if [ "$heuristic_level" = "high-confidence malicious" ]; then
+  echo "Blocked: $heuristic_reason (false-positive risk: $heuristic_rule_risk)." >&2
   exit 126
 fi
 
 llm_decision="unknown"
 llm_reason=""
 llm_parse_warning=""
+allow="yes"
+block_reason=""
 
 select_provider
 echo "$provider_status" >&2
@@ -249,7 +271,10 @@ echo "$provider_status" >&2
 if [ "$NO_AI" = "1" ] || [ "$NO_AI" = "true" ] || [ "$NO_AI" = "TRUE" ] || [ "$NO_AI" = "yes" ] || [ "$NO_AI" = "YES" ]; then
   llm_decision="skipped"
   llm_reason="AI disabled by SBASH_NO_AI"
-elif [ "$selected_provider" != "none" ] && [ "$heuristic_level" != "dangerous" ]; then
+elif [ "$selected_provider" = "none" ]; then
+  allow="no"
+  block_reason="AI review required but no provider is available"
+else
   tmp_ai="$(mktemp)" || {
     echo "sbash: failed to create temp file" >&2
     exit 1
@@ -301,9 +326,6 @@ print(r.strip())
     fi
   fi
 fi
-
-allow="yes"
-block_reason=""
 
 if [ "$MODE" = "cautious" ]; then
   if [ "$heuristic_level" = "suspicious" ] && [ "$llm_decision" != "allow" ]; then

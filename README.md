@@ -2,6 +2,14 @@
 
 `sbash` adds lightweight policy checks before executing shell scripts piped on stdin.
 
+## Heuristic ruleset
+
+- Regex heuristics live in `rules/heuristic_rules.tsv` so they are easy to audit in one file.
+- Rule severity levels:
+  - `high-confidence malicious` → immediate block.
+  - `suspicious` → forwarded to AI for tie-break.
+  - `clean` (default when no regex matches) → requires AI review unless `SBASH_NO_AI` is set.
+
 ## Policy env vars
 
 - `SBASH_MODE` (default: `normal`)
@@ -17,7 +25,8 @@
   - In `normal` mode default is allow on provider/parse error (`1`).
   - In `cautious` mode default is block via `uncertain` on provider/parse error (`0`).
 
-## Defaults (low-friction)
+## Defaults
 
-- `normal` mode allows uncertain/error paths by default.
-- `cautious` mode blocks uncertain/error paths by default.
+- Without `SBASH_NO_AI`, scripts require AI review (unless blocked first by a `high-confidence malicious` rule).
+- `normal` mode allows provider/parse error paths by default (`SBASH_ALLOW_ON_ERROR=1`).
+- `cautious` mode blocks provider/parse error paths by default (`SBASH_ALLOW_ON_ERROR=0`).
