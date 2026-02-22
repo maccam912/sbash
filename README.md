@@ -23,7 +23,7 @@ That is the main workflow: same command shape, safer default.
 Install `sbash` somewhere on your `PATH` (for example `/usr/local/bin`):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dchevell/sbash/main/sbash -o sbash
+curl -fsSL https://raw.githubusercontent.com/maccam912/sbash/main/sbash -o sbash
 chmod +x sbash
 sudo mv sbash /usr/local/bin/sbash
 ```
@@ -36,12 +36,42 @@ sbash --help || true
 
 ## Table of contents
 
+- [Quick demo: test malware signature block](#quick-demo-test-malware-signature-block)
 - [Why this exists](#why-this-exists)
 - [How decisions are made](#how-decisions-are-made)
 - [Publisher-friendly fallback command](#publisher-friendly-fallback-command)
 - [Heuristic ruleset](#heuristic-ruleset)
 - [Policy environment variables](#policy-environment-variables)
 - [Defaults](#defaults)
+
+## Quick demo: test malware signature block
+
+This repo includes `scary-demo-script.sh`, a harmless demo script with `SBASH_MALWARE_TEST_STRING` so you can see the before/after behavior via raw GitHub content.
+
+Run with `bash` (executes and prints the warning):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/maccam912/sbash/main/scary-demo-script.sh | bash
+```
+
+Expected output:
+
+```text
+⚠️  If you are seeing this, the script actually executed.
+⚠️  A real malicious script could have run commands here.
+```
+
+Run with `sbash` (same command shape, blocked by the high-confidence test-signature heuristic):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/maccam912/sbash/main/scary-demo-script.sh | sbash
+```
+
+Expected output:
+
+```text
+Blocked: contains test malware signature string (false-positive risk: low).
+```
 
 ## Why this exists
 
