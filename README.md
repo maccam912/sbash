@@ -1,6 +1,60 @@
 # sbash
 
-`sbash` adds lightweight policy checks before executing shell scripts piped on stdin.
+`sbash` is a drop-in replacement for `bash` when running scripts from stdin. It adds lightweight checks before execution so risky one-liners are less likely to run by accident.
+
+## Replace `bash` with `sbash` in copy/paste commands
+
+If you see:
+
+```bash
+curl -fsSL https://example.com/install.sh | bash
+```
+
+use:
+
+```bash
+curl -fsSL https://example.com/install.sh | sbash
+```
+
+That is the main workflow: same command shape, safer default.
+
+## Install
+
+Install `sbash` somewhere on your `PATH` (for example `/usr/local/bin`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dchevell/sbash/main/sbash -o sbash
+chmod +x sbash
+sudo mv sbash /usr/local/bin/sbash
+```
+
+Verify:
+
+```bash
+sbash --help || true
+```
+
+## Table of contents
+
+- [Why this exists](#why-this-exists)
+- [How decisions are made](#how-decisions-are-made)
+- [Publisher-friendly fallback command](#publisher-friendly-fallback-command)
+- [Heuristic ruleset](#heuristic-ruleset)
+- [Policy environment variables](#policy-environment-variables)
+- [Defaults](#defaults)
+
+## Why this exists
+
+Many people know they should not blindly pipe internet scripts to a shell, but still do it because it is fast and easy. `sbash` keeps the easy workflow while adding a review layer. It is not perfect, but it is better than running everything with no checks.
+
+## How decisions are made
+
+`sbash` uses two stages:
+
+1. **Heuristic rules** from `rules/heuristic_rules.tsv`.
+2. **Provider review** (CLI/API) unless `SBASH_NO_AI` is set.
+
+If a high-confidence malicious rule matches, the script is blocked immediately.
 
 ## Publisher-friendly fallback command
 
@@ -10,9 +64,6 @@ while still supporting users who only have `bash`:
 ```bash
 curl -fsSL https://example.com/install.sh | (command -v sbash >/dev/null 2>&1 && exec sbash || exec bash)
 ```
-
-This gives you an `sbash`-first default without breaking installs for users who have not
-installed `sbash` yet.
 
 If your installer expects positional arguments, pass them after `--`:
 
@@ -26,16 +77,16 @@ curl -fsSL https://example.com/install.sh \
 - Regex heuristics live in `rules/heuristic_rules.tsv` so they are easy to audit in one file.
 - Rule severity levels:
   - `high-confidence malicious` → immediate block.
-  - `suspicious` → forwarded to AI for tie-break.
-  - `clean` (default when no regex matches) → requires AI review unless `SBASH_NO_AI` is set.
+  - `suspicious` → forwarded to provider review.
+  - `clean` (default when no regex matches) → requires provider review unless `SBASH_NO_AI` is set.
 
-## Policy env vars
+## Policy environment variables
 
 - `SBASH_MODE` (default: `normal`)
   - `normal`: low-friction defaults; blocks only explicit `block` decisions.
   - `cautious`: stricter defaults; blocks `uncertain` and provider-error paths unless explicitly overridden.
 - `SBASH_NO_AI` (default: `0`)
-  - When truthy (`1`, `true`, `yes`), skips model/provider calls.
+  - When truthy (`1`, `true`, `yes`), skips provider calls.
 - `SBASH_TIMEOUT_MS` (default: `6000`)
   - Max provider call latency in milliseconds.
 - `SBASH_EXPLAIN` (default: `0`)
@@ -46,6 +97,6 @@ curl -fsSL https://example.com/install.sh \
 
 ## Defaults
 
-- Without `SBASH_NO_AI`, scripts require AI review (unless blocked first by a `high-confidence malicious` rule).
+- Without `SBASH_NO_AI`, scripts require provider review (unless blocked first by a `high-confidence malicious` rule).
 - `normal` mode allows provider/parse error paths by default (`SBASH_ALLOW_ON_ERROR=1`).
 - `cautious` mode blocks provider/parse error paths by default (`SBASH_ALLOW_ON_ERROR=0`).
