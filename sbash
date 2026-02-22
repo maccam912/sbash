@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+set -u
+
+MODE="${SBASH_MODE:-normal}"
+LLM_URL="${SBASH_LLM_URL:-}"
+LLM_KEY="${SBASH_LLM_API_KEY:-}"
+
+tmp_script=""
+tmp_ai=""
+cleanup() {
+  [ -n "$tmp_script" ] && [ -f "$tmp_script" ] && rm -f "$tmp_script"
+  [ -n "$tmp_ai" ] && [ -f "$tmp_ai" ] && rm -f "$tmp_ai"
+}
+trap cleanup EXIT INT TERM
+
+if [ -t 0 ]; then
+  exec bash "$@"
+fi
+
+tmp_script="$(mktemp)" || {
+  echo "sbash: failed to create temp file" >&2
+  exit 1
+}
+
+cat >"$tmp_script"
+script_text="$(cat "$tmp_script")"
+
+heuristic_level="clear"
+heuristic_reason=""
+
+if printf '%s\n' "$script_text" | grep -Eiq '(^|[[:space:]])rm[[:space:]]+-rf[[:space:]]+/(\s|$|[^[:alnum:]_])'; then
+  heuristic_level="dangerous"
+  heuristic_reason="contains destructive root deletion pattern"
+elif printf '%s\n' "$script_text" | grep -Eiq '(^|[[:space:]])(mkfs|fdisk|parted|wipefs)([[:space:]]|$)'; then
+  heuristic_level="dangerous"
+  heuristic_reason="contains disk formatting or partitioning command"
+elif printf '%s\n' "$script_text" | grep -Eiq ':\(\)[[:space:]]*\{[[:space:]]*:[[:space:]]*\|[[:space:]]*:[[:space:]]*&[[:space:]]*\};[[:space:]]*:'; then
+  heuristic_level="dangerous"
+  heuristic_reason="contains fork bomb pattern"
+elif printf '%s\n' "$script_text" | grep -Eiq '(^|[[:space:]])dd[[:space:]].*of=/dev/(sd[a-z]|nvme[0-9]+n[0-9]+|vd[a-z])'; then
+  heuristic_level="dangerous"
+  heuristic_reason="contains direct block-device overwrite command"
+elif printf '%s\n' "$script_text" | grep -Eiq 'curl[^\n|;]*\|[[:space:]]*(sh|bash)\b|wget[^\n|;]*\|[[:space:]]*(sh|bash)\b'; then
+  heuristic_level="suspicious"
+  heuristic_reason="contains remote script piping into a shell"
+elif printf '%s\n' "$script_text" | grep -Eiq '(^|[[:space:]])(sudo[[:space:]]+)?rm[[:space:]]+-rf[[:space:]]+~|(^|[[:space:]])eval[[:space:]]'; then
+  heuristic_level="suspicious"
+  heuristic_reason="contains risky command constructs"
+fi
+
+if [ "$heuristic_level" = "dangerous" ]; then
+  echo "Blocked: $heuristic_reason." >&2
+  exit 126
+fi
+
+llm_decision="unknown"
+llm_reason=""
+
+if [ -n "$LLM_URL" ] && command -v curl >/dev/null 2>&1 && [ "$heuristic_level" != "dangerous" ]; then
+  tmp_ai="$(mktemp)" || {
+    echo "sbash: failed to create temp file" >&2
+    exit 1
+  }
+
+  prompt="You are a shell safety checker. Respond on one line in this exact format: DECISION: <ALLOW|BLOCK|CAUTION>; REASON: <short reason>.\nHeuristic status: $heuristic_level.\nScript:\n$script_text"
+
+  auth_header=""
+  if [ -n "$LLM_KEY" ]; then
+    auth_header="Authorization: Bearer $LLM_KEY"
+  fi
+
+  if [ -n "$auth_header" ]; then
+    curl -sS -m 15 -X POST "$LLM_URL" \
+      -H "Content-Type: application/json" \
+      -H "$auth_header" \
+      -d "{\"prompt\": $(printf '%s' "$prompt" | sed 's/\\/\\\\/g; s/"/\\"/g; :a;N;$!ba;s/\n/\\n/g' | awk '{printf "\"%s\"", $0}') }" \
+      >"$tmp_ai" || true
+  else
+    curl -sS -m 15 -X POST "$LLM_URL" \
+      -H "Content-Type: application/json" \
+      -d "{\"prompt\": $(printf '%s' "$prompt" | sed 's/\\/\\\\/g; s/"/\\"/g; :a;N;$!ba;s/\n/\\n/g' | awk '{printf "\"%s\"", $0}') }" \
+      >"$tmp_ai" || true
+  fi
+
+  ai_line="$(grep -Eo 'DECISION:[^\n]*' "$tmp_ai" | head -n1)"
+  if [ -n "$ai_line" ]; then
+    llm_decision="$(printf '%s\n' "$ai_line" | sed -E 's/.*DECISION:[[:space:]]*([A-Z]+).*/\1/' | tr '[:upper:]' '[:lower:]')"
+    llm_reason="$(printf '%s\n' "$ai_line" | sed -E 's/.*REASON:[[:space:]]*//')"
+  fi
+fi
+
+allow="yes"
+block_reason=""
+
+if [ "$MODE" = "cautious" ]; then
+  if [ "$heuristic_level" = "suspicious" ] && [ "$llm_decision" != "allow" ]; then
+    allow="no"
+    block_reason="suspicious script in cautious mode"
+  elif [ "$llm_decision" = "block" ]; then
+    allow="no"
+    block_reason="AI checker flagged script"
+  fi
+else
+  if [ "$llm_decision" = "block" ]; then
+    allow="no"
+    block_reason="AI checker flagged script"
+  fi
+fi
+
+if [ "$allow" != "yes" ]; then
+  if [ -n "$llm_reason" ]; then
+    echo "Blocked: $block_reason ($llm_reason)." >&2
+  elif [ -n "$heuristic_reason" ]; then
+    echo "Blocked: $block_reason ($heuristic_reason)." >&2
+  else
+    echo "Blocked: $block_reason." >&2
+  fi
+  exit 126
+fi
+
+bash "$tmp_script" "$@"
+exit $?
