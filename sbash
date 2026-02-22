@@ -2,9 +2,39 @@
 set -u
 
 MODE="${SBASH_MODE:-normal}"
+NO_AI="${SBASH_NO_AI:-0}"
+TIMEOUT_MS="${SBASH_TIMEOUT_MS:-6000}"
+EXPLAIN="${SBASH_EXPLAIN:-0}"
+ALLOW_ON_ERROR="${SBASH_ALLOW_ON_ERROR:-}"
 LLM_URL="${SBASH_LLM_URL:-}"
 LLM_KEY="${SBASH_LLM_API_KEY:-}"
 SCRIPT_SOURCE_URL="${SBASH_SOURCE_URL:-${SCRIPT_SOURCE_URL:-}}"
+
+if [ "$MODE" != "normal" ] && [ "$MODE" != "cautious" ]; then
+  MODE="normal"
+fi
+
+if [ -z "$ALLOW_ON_ERROR" ]; then
+  if [ "$MODE" = "cautious" ]; then
+    ALLOW_ON_ERROR="0"
+  else
+    ALLOW_ON_ERROR="1"
+  fi
+fi
+
+should_allow_on_error() {
+  case "$ALLOW_ON_ERROR" in
+    1|true|TRUE|yes|YES|on|ON)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+print_explain() {
+  [ "$EXPLAIN" = "1" ] || [ "$EXPLAIN" = "true" ] || [ "$EXPLAIN" = "TRUE" ] || [ "$EXPLAIN" = "yes" ] || [ "$EXPLAIN" = "YES" ] || return 0
+  echo "sbash explain: mode=$MODE heuristic=$heuristic_level provider=$selected_provider ai_decision=$llm_decision allow=$allow" >&2
+}
 
 selected_provider="none"
 provider_method="none"
@@ -91,19 +121,45 @@ invoke_provider() {
   # $1 = prompt, $2 = output file
   local prompt="$1"
   local out="$2"
+  local timeout_s=""
+  local run_prefix=""
+
+  timeout_s="$(python3 -c 'import math,sys
+try:
+  ms=max(1,int(sys.argv[1]))
+except Exception:
+  ms=6000
+print(max(1,math.ceil(ms/1000)))
+' "$TIMEOUT_MS" 2>/dev/null || printf '6')"
+
+  if command -v timeout >/dev/null 2>&1; then
+    run_prefix="timeout $timeout_s"
+  fi
 
   if [ "$provider_method" = "cli" ]; then
     case "$selected_provider" in
       codex)
-        codex "$prompt" >"$out" 2>/dev/null
+        if [ -n "$run_prefix" ]; then
+          timeout "$timeout_s" codex "$prompt" >"$out" 2>/dev/null
+        else
+          codex "$prompt" >"$out" 2>/dev/null
+        fi
         return $?
         ;;
       claude)
-        claude "$prompt" >"$out" 2>/dev/null
+        if [ -n "$run_prefix" ]; then
+          timeout "$timeout_s" claude "$prompt" >"$out" 2>/dev/null
+        else
+          claude "$prompt" >"$out" 2>/dev/null
+        fi
         return $?
         ;;
       gemini)
-        gemini "$prompt" >"$out" 2>/dev/null
+        if [ -n "$run_prefix" ]; then
+          timeout "$timeout_s" gemini "$prompt" >"$out" 2>/dev/null
+        else
+          gemini "$prompt" >"$out" 2>/dev/null
+        fi
         return $?
         ;;
     esac
@@ -115,7 +171,13 @@ invoke_provider() {
     [ -n "${LLM_KEY:-}" ] || LLM_KEY="${OPENAI_API_KEY:-${ANTHROPIC_API_KEY:-${GEMINI_API_KEY:-${OPENROUTER_API_KEY:-}}}}"
     [ -n "$LLM_KEY" ] || return 1
 
-    curl -sS -m 6 -X POST "$LLM_URL" \
+    curl -sS --max-time "$(python3 -c 'import sys
+try:
+  ms=max(1,int(sys.argv[1]))
+except Exception:
+  ms=6000
+print(f"{ms/1000:.3f}")
+' "$TIMEOUT_MS" 2>/dev/null || printf '6')" -X POST "$LLM_URL" \
       -H "Content-Type: application/json" \
       -H "Authorization: Bearer $LLM_KEY" \
       -d "{\"prompt\": $(printf '%s' "$prompt" | sed 's/\\/\\\\/g; s/\"/\\\"/g; :a;N;$!ba;s/\n/\\n/g' | awk '{printf "\"%s\"", $0}'), \"max_tokens\": 120 }" \
@@ -181,7 +243,10 @@ llm_parse_warning=""
 select_provider
 echo "$provider_status" >&2
 
-if [ "$selected_provider" != "none" ] && [ "$heuristic_level" != "dangerous" ]; then
+if [ "$NO_AI" = "1" ] || [ "$NO_AI" = "true" ] || [ "$NO_AI" = "TRUE" ] || [ "$NO_AI" = "yes" ] || [ "$NO_AI" = "YES" ]; then
+  llm_decision="skipped"
+  llm_reason="AI disabled by SBASH_NO_AI"
+elif [ "$selected_provider" != "none" ] && [ "$heuristic_level" != "dangerous" ]; then
   tmp_ai="$(mktemp)" || {
     echo "sbash: failed to create temp file" >&2
     exit 1
@@ -190,7 +255,14 @@ if [ "$selected_provider" != "none" ] && [ "$heuristic_level" != "dangerous" ]; 
   prompt="$(build_review_prompt "$heuristic_level" "$script_text")"
 
   if ! invoke_provider "$prompt" "$tmp_ai"; then
-    echo "sbash: provider call failed; running local-only safety checks" >&2
+    if should_allow_on_error; then
+      llm_decision="allow"
+      llm_reason="provider failure allowed by policy"
+    else
+      llm_decision="uncertain"
+      llm_reason="provider failure"
+    fi
+    echo "sbash: provider call failed; applying error policy" >&2
   fi
 
   ai_json="$(cat "$tmp_ai")"
@@ -211,18 +283,18 @@ print(d.lower())
 print(r.strip())
 ' 2>/dev/null)"
 
-  if [ -n "$parsed_fields" ]; then
+  if [ -n "$parsed_fields" ] && [ "$llm_decision" = "unknown" ]; then
     llm_decision="$(printf '%s\n' "$parsed_fields" | sed -n '1p')"
     llm_reason="$(printf '%s\n' "$parsed_fields" | sed -n '2p')"
-  else
-    if [ "$MODE" = "cautious" ]; then
+  elif [ "$llm_decision" = "unknown" ]; then
+    if should_allow_on_error; then
+      llm_decision="allow"
+      llm_reason="invalid AI JSON response"
+      llm_parse_warning="invalid JSON from AI; allowed by error policy"
+    else
       llm_decision="uncertain"
       llm_reason="invalid AI JSON response"
       llm_parse_warning="invalid JSON from AI; defaulted to uncertain"
-    else
-      llm_decision="allow"
-      llm_reason=""
-      llm_parse_warning="invalid JSON from AI; allowed in non-cautious mode"
     fi
   fi
 fi
@@ -248,6 +320,8 @@ fi
 if [ -n "$llm_parse_warning" ]; then
   echo "sbash: $llm_parse_warning" >&2
 fi
+
+print_explain
 
 if [ "$allow" != "yes" ]; then
   if [ -n "$llm_reason" ]; then
