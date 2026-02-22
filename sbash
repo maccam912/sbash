@@ -223,6 +223,9 @@ elif printf '%s\n' "$script_text" | grep -Eiq ':\(\)[[:space:]]*\{[[:space:]]*:[
 elif printf '%s\n' "$script_text" | grep -Eiq '(^|[[:space:]])dd[[:space:]].*of=/dev/(sd[a-z]|nvme[0-9]+n[0-9]+|vd[a-z])'; then
   heuristic_level="dangerous"
   heuristic_reason="contains direct block-device overwrite command"
+elif printf '%s\n' "$script_text" | grep -Fq 'SBASH_MALWARE_TEST_STRING'; then
+  heuristic_level="dangerous"
+  heuristic_reason="contains test malware signature string"
 elif printf '%s\n' "$script_text" | grep -Eiq 'curl[^\n|;]*\|[[:space:]]*(sh|bash)\b|wget[^\n|;]*\|[[:space:]]*(sh|bash)\b'; then
   heuristic_level="suspicious"
   heuristic_reason="contains remote script piping into a shell"
