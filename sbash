@@ -4,6 +4,7 @@ set -u
 MODE="${SBASH_MODE:-normal}"
 LLM_URL="${SBASH_LLM_URL:-}"
 LLM_KEY="${SBASH_LLM_API_KEY:-}"
+SCRIPT_SOURCE_URL="${SBASH_SOURCE_URL:-${SCRIPT_SOURCE_URL:-}}"
 
 selected_provider="none"
 provider_method="none"
@@ -60,6 +61,32 @@ select_provider() {
   fi
 }
 
+build_review_prompt() {
+  # $1 = heuristic level, $2 = script text
+  local heuristic="$1"
+  local script="$2"
+  local line_count
+  local source_line=""
+
+  line_count="$(printf '%s\n' "$script" | wc -l | awk '{print $1}')"
+  if [ -n "$SCRIPT_SOURCE_URL" ]; then
+    source_line="- source_url: $SCRIPT_SOURCE_URL\n"
+  fi
+
+  cat <<PROMPT
+Role: quick triage for shell installer scripts.
+Return JSON only (no markdown, no prose before/after). Use this exact schema:
+{"decision":"allow|block|uncertain","reason":"short string","confidence":"low|medium|high"}
+Instruction: prefer "uncertain" over over-asserting when evidence is incomplete.
+
+Input:
+- heuristic_level: $heuristic
+${source_line}- size_lines: $line_count
+- script_content:
+$script
+PROMPT
+}
+
 invoke_provider() {
   # $1 = prompt, $2 = output file
   local prompt="$1"
@@ -88,10 +115,10 @@ invoke_provider() {
     [ -n "${LLM_KEY:-}" ] || LLM_KEY="${OPENAI_API_KEY:-${ANTHROPIC_API_KEY:-${GEMINI_API_KEY:-${OPENROUTER_API_KEY:-}}}}"
     [ -n "$LLM_KEY" ] || return 1
 
-    curl -sS -m 15 -X POST "$LLM_URL" \
+    curl -sS -m 6 -X POST "$LLM_URL" \
       -H "Content-Type: application/json" \
       -H "Authorization: Bearer $LLM_KEY" \
-      -d "{\"prompt\": $(printf '%s' "$prompt" | sed 's/\\/\\\\/g; s/\"/\\\"/g; :a;N;$!ba;s/\n/\\n/g' | awk '{printf "\"%s\"", $0}') }" \
+      -d "{\"prompt\": $(printf '%s' "$prompt" | sed 's/\\/\\\\/g; s/\"/\\\"/g; :a;N;$!ba;s/\n/\\n/g' | awk '{printf "\"%s\"", $0}'), \"max_tokens\": 120 }" \
       >"$out"
     return $?
   fi
@@ -149,6 +176,7 @@ fi
 
 llm_decision="unknown"
 llm_reason=""
+llm_parse_warning=""
 
 select_provider
 echo "$provider_status" >&2
@@ -159,16 +187,43 @@ if [ "$selected_provider" != "none" ] && [ "$heuristic_level" != "dangerous" ]; 
     exit 1
   }
 
-  prompt="You are a shell safety checker. Respond on one line in this exact format: DECISION: <ALLOW|BLOCK|CAUTION>; REASON: <short reason>.\nHeuristic status: $heuristic_level.\nScript:\n$script_text"
+  prompt="$(build_review_prompt "$heuristic_level" "$script_text")"
 
   if ! invoke_provider "$prompt" "$tmp_ai"; then
     echo "sbash: provider call failed; running local-only safety checks" >&2
   fi
 
-  ai_line="$(grep -Eo 'DECISION:[^\n]*' "$tmp_ai" | head -n1)"
-  if [ -n "$ai_line" ]; then
-    llm_decision="$(printf '%s\n' "$ai_line" | sed -E 's/.*DECISION:[[:space:]]*([A-Z]+).*/\1/' | tr '[:upper:]' '[:lower:]')"
-    llm_reason="$(printf '%s\n' "$ai_line" | sed -E 's/.*REASON:[[:space:]]*//')"
+  ai_json="$(cat "$tmp_ai")"
+  parsed_fields="$(printf '%s' "$ai_json" | python3 -c 'import json,sys
+raw=sys.stdin.read().strip()
+if not raw:
+  sys.exit(2)
+start=raw.find("{")
+end=raw.rfind("}")
+if start==-1 or end==-1 or end<start:
+  sys.exit(2)
+obj=json.loads(raw[start:end+1])
+if not isinstance(obj,dict):
+  sys.exit(2)
+d=str(obj.get("decision",""))
+r=str(obj.get("reason",""))
+print(d.lower())
+print(r.strip())
+' 2>/dev/null)"
+
+  if [ -n "$parsed_fields" ]; then
+    llm_decision="$(printf '%s\n' "$parsed_fields" | sed -n '1p')"
+    llm_reason="$(printf '%s\n' "$parsed_fields" | sed -n '2p')"
+  else
+    if [ "$MODE" = "cautious" ]; then
+      llm_decision="uncertain"
+      llm_reason="invalid AI JSON response"
+      llm_parse_warning="invalid JSON from AI; defaulted to uncertain"
+    else
+      llm_decision="allow"
+      llm_reason=""
+      llm_parse_warning="invalid JSON from AI; allowed in non-cautious mode"
+    fi
   fi
 fi
 
@@ -179,15 +234,19 @@ if [ "$MODE" = "cautious" ]; then
   if [ "$heuristic_level" = "suspicious" ] && [ "$llm_decision" != "allow" ]; then
     allow="no"
     block_reason="suspicious script in cautious mode"
-  elif [ "$llm_decision" = "block" ]; then
+  elif [ "$llm_decision" = "block" ] || [ "$llm_decision" = "uncertain" ]; then
     allow="no"
-    block_reason="AI checker flagged script"
+    block_reason="AI checker did not confidently allow script"
   fi
 else
   if [ "$llm_decision" = "block" ]; then
     allow="no"
     block_reason="AI checker flagged script"
   fi
+fi
+
+if [ -n "$llm_parse_warning" ]; then
+  echo "sbash: $llm_parse_warning" >&2
 fi
 
 if [ "$allow" != "yes" ]; then
