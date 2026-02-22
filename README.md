@@ -2,6 +2,25 @@
 
 `sbash` adds lightweight policy checks before executing shell scripts piped on stdin.
 
+## Publisher-friendly fallback command
+
+If you are publishing an installer command in a website or README, you can prefer `sbash`
+while still supporting users who only have `bash`:
+
+```bash
+curl -fsSL https://example.com/install.sh | (command -v sbash >/dev/null 2>&1 && exec sbash || exec bash)
+```
+
+This gives you an `sbash`-first default without breaking installs for users who have not
+installed `sbash` yet.
+
+If your installer expects positional arguments, pass them after `--`:
+
+```bash
+curl -fsSL https://example.com/install.sh \
+  | (command -v sbash >/dev/null 2>&1 && exec sbash --channel stable || exec bash -s -- --channel stable)
+```
+
 ## Heuristic ruleset
 
 - Regex heuristics live in `rules/heuristic_rules.tsv` so they are easy to audit in one file.
