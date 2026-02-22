@@ -1,4 +1,5 @@
 # severity\tregex\treason\tfalse_positive_risk
+# Rules are evaluated in order; the first match wins. List more-severe rules before less-severe ones.
 # HIGH-CONFIDENCE MALICIOUS: explicit root filesystem wipe. False-positive risk: low; destructive intent is usually explicit.
 high-confidence malicious	(^|[[:space:]])rm[[:space:]]+-rf[[:space:]]+/([[:space:]]|$|[^[:alnum:]_])	contains destructive root deletion pattern	low
 # HIGH-CONFIDENCE MALICIOUS: filesystem/partition tooling often used to erase disks. False-positive risk: medium in legitimate provisioning scripts.
