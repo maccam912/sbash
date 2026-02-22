@@ -34,7 +34,10 @@ should_allow_on_error() {
 }
 
 print_explain() {
-  [ "$EXPLAIN" = "1" ] || [ "$EXPLAIN" = "true" ] || [ "$EXPLAIN" = "TRUE" ] || [ "$EXPLAIN" = "yes" ] || [ "$EXPLAIN" = "YES" ] || return 0
+  case "$EXPLAIN" in
+    1|true|TRUE|yes|YES) ;;
+    *) return 0 ;;
+  esac
   echo "sbash explain: mode=$MODE heuristic=$heuristic_level provider=$selected_provider ai_decision=$llm_decision allow=$allow" >&2
 }
 
@@ -182,7 +185,7 @@ print(f"{ms/1000:.3f}")
 ' "$TIMEOUT_MS" 2>/dev/null || printf '6')" -X POST "$LLM_URL" \
       -H "Content-Type: application/json" \
       -H "Authorization: Bearer $LLM_KEY" \
-      -d "{\"prompt\": $(printf '%s' "$prompt" | sed 's/\\/\\\\/g; s/\"/\\\"/g; :a;N;$!ba;s/\n/\\n/g' | awk '{printf "\"%s\"", $0}'), \"max_tokens\": 120 }" \
+      -d "$(printf '%s' "$prompt" | python3 -c 'import json,sys; print(json.dumps({"prompt": sys.stdin.read(), "max_tokens": 120}))')" \
       >"$out"
     return $?
   fi
@@ -266,35 +269,41 @@ allow="yes"
 block_reason=""
 
 select_provider
-echo "$provider_status" >&2
 
-if [ "$NO_AI" = "1" ] || [ "$NO_AI" = "true" ] || [ "$NO_AI" = "TRUE" ] || [ "$NO_AI" = "yes" ] || [ "$NO_AI" = "YES" ]; then
-  llm_decision="skipped"
-  llm_reason="AI disabled by SBASH_NO_AI"
-elif [ "$selected_provider" = "none" ]; then
-  allow="no"
-  block_reason="AI review required but no provider is available"
-else
-  tmp_ai="$(mktemp)" || {
-    echo "sbash: failed to create temp file" >&2
-    exit 1
-  }
-
-  prompt="$(build_review_prompt "$heuristic_level" "$script_text")"
-
-  if ! invoke_provider "$prompt" "$tmp_ai"; then
-    if should_allow_on_error; then
-      llm_decision="allow"
-      llm_reason="provider failure allowed by policy"
+case "$NO_AI" in
+  1|true|TRUE|yes|YES)
+    llm_decision="skipped"
+    llm_reason="AI disabled by SBASH_NO_AI"
+    ;;
+  *)
+    if [ "$selected_provider" = "none" ]; then
+      echo "$provider_status" >&2
+      allow="no"
+      block_reason="AI review required but no provider is available"
     else
-      llm_decision="uncertain"
-      llm_reason="provider failure"
-    fi
-    echo "sbash: provider call failed; applying error policy" >&2
-  fi
+      echo "$provider_status" >&2
+      tmp_ai="$(mktemp)" || {
+        echo "sbash: failed to create temp file" >&2
+        exit 1
+      }
 
-  ai_json="$(cat "$tmp_ai")"
-  parsed_fields="$(printf '%s' "$ai_json" | python3 -c 'import json,sys
+      prompt="$(build_review_prompt "$heuristic_level" "$script_text")"
+
+      if ! invoke_provider "$prompt" "$tmp_ai"; then
+        if should_allow_on_error; then
+          llm_decision="allow"
+          llm_reason="provider failure allowed by policy"
+        else
+          llm_decision="uncertain"
+          llm_reason="provider failure"
+        fi
+        echo "sbash: provider call failed; applying error policy" >&2
+      fi
+
+      ai_json="$(cat "$tmp_ai")"
+      # Parse JSON from provider response. llm_decision stays "unknown" until
+      # parsing succeeds or the error-policy fallback below runs.
+      parsed_fields="$(printf '%s' "$ai_json" | python3 -c 'import json,sys
 raw=sys.stdin.read().strip()
 if not raw:
   sys.exit(2)
@@ -311,21 +320,25 @@ print(d.lower())
 print(r.strip())
 ' 2>/dev/null)"
 
-  if [ -n "$parsed_fields" ] && [ "$llm_decision" = "unknown" ]; then
-    llm_decision="$(printf '%s\n' "$parsed_fields" | sed -n '1p')"
-    llm_reason="$(printf '%s\n' "$parsed_fields" | sed -n '2p')"
-  elif [ "$llm_decision" = "unknown" ]; then
-    if should_allow_on_error; then
-      llm_decision="allow"
-      llm_reason="invalid AI JSON response"
-      llm_parse_warning="invalid JSON from AI; allowed by error policy"
-    else
-      llm_decision="uncertain"
-      llm_reason="invalid AI JSON response"
-      llm_parse_warning="invalid JSON from AI; defaulted to uncertain"
+      if [ -n "$parsed_fields" ] && [ "$llm_decision" = "unknown" ]; then
+        # Successful parse: pull decision and reason from the provider JSON.
+        llm_decision="$(printf '%s\n' "$parsed_fields" | sed -n '1p')"
+        llm_reason="$(printf '%s\n' "$parsed_fields" | sed -n '2p')"
+      elif [ "$llm_decision" = "unknown" ]; then
+        # Provider call succeeded but returned unparseable JSON; apply error policy.
+        if should_allow_on_error; then
+          llm_decision="allow"
+          llm_reason="invalid AI JSON response"
+          llm_parse_warning="invalid JSON from AI; allowed by error policy"
+        else
+          llm_decision="uncertain"
+          llm_reason="invalid AI JSON response"
+          llm_parse_warning="invalid JSON from AI; defaulted to uncertain"
+        fi
+      fi
     fi
-  fi
-fi
+    ;;
+esac
 
 if [ "$MODE" = "cautious" ]; then
   if [ "$heuristic_level" = "suspicious" ] && [ "$llm_decision" != "allow" ]; then
