@@ -1,0 +1,15 @@
+# severity\tregex\treason\tfalse_positive_risk
+# HIGH-CONFIDENCE MALICIOUS: explicit root filesystem wipe. False-positive risk: low; destructive intent is usually explicit.
+high-confidence malicious	(^|[[:space:]])rm[[:space:]]+-rf[[:space:]]+/([[:space:]]|$|[^[:alnum:]_])	contains destructive root deletion pattern	low
+# HIGH-CONFIDENCE MALICIOUS: filesystem/partition tooling often used to erase disks. False-positive risk: medium in legitimate provisioning scripts.
+high-confidence malicious	(^|[[:space:]])(mkfs|fdisk|parted|wipefs)([[:space:]]|$)	contains disk formatting or partitioning command	medium
+# HIGH-CONFIDENCE MALICIOUS: classic fork bomb. False-positive risk: low; pattern is highly specific.
+high-confidence malicious	:\(\)[[:space:]]*\{[[:space:]]*:[[:space:]]*\|[[:space:]]*:[[:space:]]*&[[:space:]]*\};[[:space:]]*:	contains fork bomb pattern	low
+# HIGH-CONFIDENCE MALICIOUS: direct writes to block devices. False-positive risk: medium in imaging/installer workflows.
+high-confidence malicious	(^|[[:space:]])dd[[:space:]].*of=/dev/(sd[a-z]|nvme[0-9]+n[0-9]+|vd[a-z])	contains direct block-device overwrite command	medium
+# HIGH-CONFIDENCE MALICIOUS: deterministic test signature. False-positive risk: low; intended as an explicit sentinel.
+high-confidence malicious	SBASH_MALWARE_TEST_STRING	contains test malware signature string	low
+# SUSPICIOUS: remote payload piped to shell. False-positive risk: medium; common in bootstrap installers.
+suspicious	curl[^\n|;]*\|[[:space:]]*(sh|bash)\b|wget[^\n|;]*\|[[:space:]]*(sh|bash)\b	contains remote script piping into a shell	medium
+# SUSPICIOUS: risky command composition. False-positive risk: medium-high; can appear in benign maintenance scripts.
+suspicious	(^|[[:space:]])(sudo[[:space:]]+)?rm[[:space:]]+-rf[[:space:]]+~|(^|[[:space:]])eval[[:space:]]	contains risky command constructs	medium-high
